@@ -106,8 +106,18 @@ def setup_database():
                     name TEXT NOT NULL,
                     price INTEGER NOT NULL,
                     description TEXT,
+                    category TEXT DEFAULT 'Other',
+                    priority INTEGER DEFAULT 999,
+                    discount INTEGER DEFAULT 0,
+                    limited BOOLEAN DEFAULT 0,
+                    bundle TEXT,
+                    bonus TEXT, 
+                    show_code BOOLEAN DEFAULT 1,
+                    status TEXT DEFAULT 'available' CHECK (status IN ('available', 'hidden', 'deleted')),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    deleted_at TIMESTAMP,
+                    delete_reason TEXT
                 )
             """)
 
@@ -479,7 +489,10 @@ def setup_database():
                 # Admin System Indexes
                 ("idx_user_growid_discord", "user_growid(discord_id)"),
                 ("idx_user_growid_growid", "user_growid(growid)"),
-                ("idx_stock_product_code", "stock(product_code)"),
+                # Admin System Indexes
+                ("idx_products_code", "products(code)"),
+                ("idx_products_status", "products(status)"),  # Tambahkan ini
+                ("idx_products_category", "products(category)"),  # Tambahkan ini juga
                 ("idx_stock_status", "stock(status)"),
                 ("idx_stock_content", "stock(content)"),
                 ("idx_transactions_growid", "transactions(growid)"),
@@ -490,6 +503,7 @@ def setup_database():
                 ("idx_user_activity_discord", "user_activity(discord_id)"),
                 ("idx_user_activity_type", "user_activity(activity_type)"),
                 ("idx_role_permissions_role", "role_permissions(role_id)"),
+
 
                 # Stats System Indexes
                 ("idx_activity_logs_guild", "activity_logs(guild_id)"),
