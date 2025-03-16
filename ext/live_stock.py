@@ -1,15 +1,8 @@
 """
 Live Stock Manager
-Author: fdyytu
+Author: fdyytu2
 Created at: 2025-03-07 18:30:16 UTC
-Last Modified: 2025-03-15 16:33:10 UTC
-
-Dependencies:
-- ext.product_manager: For product operations
-- ext.balance_manager: For balance operations
-- ext.trx: For transaction operations
-- ext.admin_service: For maintenance mode
-- ext.constants: For configuration and responses
+Last Modified: 2025-03-16 08:37:47 UTC
 """
 
 import discord
@@ -37,6 +30,46 @@ from .balance_manager import BalanceManagerService
 from .trx import TransactionManager
 from .admin_service import AdminService
 
+class LiveStockStats:
+    def __init__(self):
+        self.total_updates = 0
+        self.failed_updates = 0
+        self.last_update_time = None
+        self.average_update_time = 0
+        self.performance_history = []
+        self.max_history = 100
+
+    def record_update(self, success: bool, update_time: float):
+        self.total_updates += 1
+        if not success:
+            self.failed_updates += 1
+        
+        self.last_update_time = datetime.utcnow()
+        self.performance_history.append(update_time)
+        if len(self.performance_history) > self.max_history:
+            self.performance_history.pop(0)
+            
+        self.average_update_time = sum(self.performance_history) / len(self.performance_history)
+
+    def get_stats(self) -> Dict:
+        return {
+            'total_updates': self.total_updates,
+            'failed_updates': self.failed_updates,
+            'success_rate': ((self.total_updates - self.failed_updates) / self.total_updates * 100) if self.total_updates > 0 else 0,
+            'last_update': self.last_update_time.strftime("%Y-%m-%d %H:%M:%S UTC") if self.last_update_time else None,
+            'average_time': f"{self.average_update_time:.2f}s",
+            'uptime': self.get_uptime()
+        }
+
+    def get_uptime(self) -> str:
+        if not self.last_update_time:
+            return "N/A"
+        
+        delta = datetime.utcnow() - self.last_update_time
+        hours = delta.total_seconds() // 3600
+        minutes = (delta.total_seconds() % 3600) // 60
+        return f"{int(hours)}h {int(minutes)}m"
+
 class LiveStockManager(BaseLockHandler):
     def __init__(self, bot):
         if not hasattr(self, 'initialized') or not self.initialized:
@@ -44,14 +77,14 @@ class LiveStockManager(BaseLockHandler):
             self.bot = bot
             self.logger = logging.getLogger("LiveStockManager")
             self.cache_manager = CacheManager()
+            self.stats = LiveStockStats()
+            self.monitor = TransactionMonitor()
 
-            # Initialize services
             self.product_service = ProductManagerService(bot)
             self.balance_service = BalanceManagerService(bot)
             self.trx_manager = TransactionManager(bot)
             self.admin_service = AdminService(bot)
 
-            # Channel configuration
             self.stock_channel_id = int(self.bot.config.get('id_live_stock', 0))
             self.current_stock_message = None
             self.button_manager = None
@@ -60,20 +93,17 @@ class LiveStockManager(BaseLockHandler):
             self.logger.info("LiveStockManager initialized")
 
     async def initialize(self):
-        """Initialize manager and set ready state"""
         if not self._ready.is_set():
             self._ready.set()
             self.logger.info("LiveStockManager is ready")
 
     async def find_last_message(self) -> Optional[discord.Message]:
-        """Cari pesan terakhir yang dikirim bot di channel"""
         try:
             channel = self.bot.get_channel(self.stock_channel_id)
             if not channel:
                 return None
                 
-            # Cari pesan terakhir dari bot di channel
-            async for message in channel.history(limit=50):  # Batasi 50 pesan terakhir
+            async for message in channel.history(limit=50):
                 if (message.author == self.bot.user and 
                     len(message.embeds) > 0 and 
                     message.embeds[0].title and 
@@ -85,14 +115,15 @@ class LiveStockManager(BaseLockHandler):
             return None
 
     async def set_button_manager(self, button_manager):
-        """Set button manager untuk integrasi"""
         self.button_manager = button_manager
         self.logger.info("Button manager set successfully")
 
     async def create_stock_embed(self) -> discord.Embed:
-        """Buat embed untuk display stock dengan tema modern"""
         try:
-            # Check maintenance mode
+            monitor = TransactionMonitor()
+            monitor.start()
+            monitor.add_step("initializing_display")
+
             if await self.admin_service.is_maintenance_mode():
                 return discord.Embed(
                     title="🔧 Sistem dalam Maintenance",
@@ -101,7 +132,7 @@ class LiveStockManager(BaseLockHandler):
                     timestamp=datetime.utcnow()
                 )
 
-            # Get products dari ProductManager dengan proper response handling
+            monitor.add_step("fetching_products")
             cache_key = 'all_products_display'
             cached_products = await self.cache_manager.get(cache_key)
 
@@ -118,7 +149,7 @@ class LiveStockManager(BaseLockHandler):
             else:
                 products = cached_products
 
-            # Create modern embed with dark theme
+            monitor.add_step("creating_embed")
             embed = discord.Embed(
                 title="🏪 Growtopia Shop Status",
                 description=(
@@ -127,10 +158,9 @@ class LiveStockManager(BaseLockHandler):
                     "\u001b[0;90mReal-time stock monitoring system\u001b[0m\n"
                     "```"
                 ),
-                color=discord.Color.from_rgb(32, 34, 37)  # Discord dark theme color
+                color=discord.Color.from_rgb(32, 34, 37)
             )
 
-            # Server time dengan format modern
             current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             embed.add_field(
                 name="⏰ Server Time",
@@ -139,7 +169,7 @@ class LiveStockManager(BaseLockHandler):
             )
 
             try:
-                # Grouping products by category
+                monitor.add_step("processing_categories")
                 categories = {}
                 for product in products:
                     category = product.get('category', 'Other')
@@ -147,25 +177,30 @@ class LiveStockManager(BaseLockHandler):
                         categories[category] = []
                     categories[category].append(product)
 
-                for category, category_products in categories.items():
-                    # Category header dengan styling
+                priority_order = ['Premium', 'DL/BGL', 'Items', 'Other']
+                sorted_categories = sorted(
+                    categories.items(),
+                    key=lambda x: priority_order.index(x[0]) if x[0] in priority_order else len(priority_order)
+                )
+
+                for category, category_products in sorted_categories:
+                    monitor.add_step(f"processing_category_{category}")
                     category_header = f"\n__**{category}**__\n"
                     category_items = []
 
-                    for product in category_products:
-                        try:
-                            # Get stock count dengan caching
-                            try:
-                                product_code = product.get('code')
-                                if not product_code:
-                                    self.logger.error(f"Product code not found in data: {str(product)}")
-                                    continue
+                    sorted_products = sorted(
+                        category_products,
+                        key=lambda x: (x.get('priority', 999), -x.get('price', 0))
+                    )
 
-                                stock_cache_key = f'stock_count_{product_code}'
-                                stock_count = await self.cache_manager.get(stock_cache_key)
-                            except Exception as e:
-                                self.logger.error(f"Error accessing product code: {str(e)} for product: {str(product)}")
+                    for product in sorted_products:
+                        try:
+                            product_code = product.get('code')
+                            if not product_code:
                                 continue
+
+                            stock_cache_key = f'stock_count_{product_code}'
+                            stock_count = await self.cache_manager.get(stock_cache_key)
 
                             if stock_count is None:
                                 stock_response = await self.product_service.get_stock_count(product_code)
@@ -178,31 +213,41 @@ class LiveStockManager(BaseLockHandler):
                                     expires_in=CACHE_TIMEOUT.get_seconds(CACHE_TIMEOUT.SHORT)
                                 )
 
-                            # Status indicators dengan warna
                             if stock_count > Stock.ALERT_THRESHOLD:
-                                status_color = "32"  # Green
+                                status_color = "32"
                                 status_emoji = "🟢"
+                                stock_status = "In Stock"
                             elif stock_count > 0:
-                                status_color = "33"  # Yellow
+                                status_color = "33"
                                 status_emoji = "🟡"
+                                stock_status = "Limited"
                             else:
-                                status_color = "31"  # Red
+                                status_color = "31"
                                 status_emoji = "🔴"
+                                stock_status = "Out of Stock"
 
-                            # Format price menggunakan currency rates
                             price = float(product['price'])
                             price_display = self._format_price(price)
 
-                            # Product display dengan ANSI formatting
+                            product_code_display = f"[{product_code}]" if product.get('show_code', True) else ""
+                            
                             product_info = (
                                 f"```ansi\n"
-                                f"{status_emoji} \u001b[0;{status_color}m{product['name']}\u001b[0m\n"
-                                f"└─ Price : {price_display}\n"
-                                f"└─ Stock : {stock_count} unit\n"
+                                f"{status_emoji} \u001b[0;{status_color}m{product['name']} {product_code_display}\u001b[0m\n"
+                                f"└─ Price  : {price_display}\n"
+                                f"└─ Stock  : {stock_count} unit ({stock_status})\n"
                             )
 
                             if product.get('description'):
-                                product_info += f"└─ Info  : {product['description']}\n"
+                                product_info += f"└─ Info   : {product['description']}\n"
+                            if product.get('discount'):
+                                product_info += f"└─ Diskon : {product['discount']}% OFF!\n"
+                            if product.get('limited'):
+                                product_info += f"└─ Status : ⭐ Limited Edition!\n"
+                            if product.get('bundle'):
+                                product_info += f"└─ Bundle : 📦 {product['bundle']}\n"
+                            if product.get('bonus'):
+                                product_info += f"└─ Bonus  : 🎁 {product['bonus']}\n"
 
                             product_info += "```"
                             category_items.append(product_info)
@@ -219,13 +264,21 @@ class LiveStockManager(BaseLockHandler):
                             inline=False
                         )
 
+                    monitor.add_step(f"completed_category_{category}")
+
             except Exception as e:
                 self.logger.error(f"Error processing categories: {e}")
                 raise
 
-            # Footer dengan update info
+            monitor.add_step("finalizing")
+            perf_data = monitor.get_report()
+            total_time = perf_data.get('total_time', 0)
+            
             embed.set_footer(
-                text=f"Auto-update every {int(UPDATE_INTERVAL.LIVE_STOCK)} seconds • Last Update"
+                text=(
+                    f"Auto-update every {int(UPDATE_INTERVAL.LIVE_STOCK)} seconds • "
+                    f"Generated in {total_time:.2f}s"
+                )
             )
             embed.timestamp = datetime.utcnow()
 
@@ -240,7 +293,6 @@ class LiveStockManager(BaseLockHandler):
             )
 
     def _format_price(self, price: float) -> str:
-        """Format price dengan currency rates dari constants"""
         try:
             if not isinstance(price, (int, float)):
                 raise ValueError(f"Invalid price type: {type(price)}")
@@ -255,41 +307,76 @@ class LiveStockManager(BaseLockHandler):
             return "Invalid Price"
 
     async def update_stock_display(self) -> bool:
-        """Update tampilan stock tanpa mengirim pesan baru"""
+        self.monitor.start()
+        success = False
+        update_time = 0
+        
         try:
+            self.monitor.add_step("starting_update")
             channel = self.bot.get_channel(self.stock_channel_id)
             if not channel:
-                self.logger.error(f"Channel stock dengan ID {self.stock_channel_id} tidak ditemukan")
-                return False
+                raise ValueError(f"Channel stock dengan ID {self.stock_channel_id} tidak ditemukan")
 
+            self.monitor.add_step("creating_embed")
             embed = await self.create_stock_embed()
 
+            self.monitor.add_step("updating_message")
             if not self.current_stock_message:
                 self.current_stock_message = await self.find_last_message()
 
             if not self.current_stock_message:
                 view = self.button_manager.create_view() if self.button_manager else None
                 self.current_stock_message = await channel.send(embed=embed, view=view)
-                return True
+                success = True
+            else:
+                try:
+                    await self.current_stock_message.edit(embed=embed)
+                    success = True
+                except discord.NotFound:
+                    self.logger.warning(MESSAGES.WARNING['MESSAGE_NOT_FOUND'])
+                    self.current_stock_message = None
+                    view = self.button_manager.create_view() if self.button_manager else None
+                    self.current_stock_message = await channel.send(embed=embed, view=view)
+                    success = True
 
-            try:
-                await self.current_stock_message.edit(embed=embed)
-                return True
-
-            except discord.NotFound:
-                self.logger.warning(MESSAGES.WARNING['MESSAGE_NOT_FOUND'])
-                self.current_stock_message = None
-                view = self.button_manager.create_view() if self.button_manager else None
-                self.current_stock_message = await channel.send(embed=embed, view=view)
-                return True
-
+            self.monitor.add_step("update_complete")
+            perf_data = self.monitor.get_report()
+            update_time = perf_data['total_time']
+            
         except Exception as e:
             self.logger.error(f"Error updating stock display: {e}")
-            return False
+            success = False
+        finally:
+            self.stats.record_update(success, update_time)
+            return success
+
+    async def get_performance_embed(self) -> discord.Embed:
+        stats = self.stats.get_stats()
+        embed = discord.Embed(
+            title="📊 LiveStock Performance Stats",
+            color=COLORS.INFO,
+            timestamp=datetime.utcnow()
+        )
+        
+        embed.add_field(
+            name="Updates",
+            value=f"```\nTotal: {stats['total_updates']}\nFailed: {stats['failed_updates']}\nSuccess Rate: {stats['success_rate']:.1f}%\n```",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Timing",
+            value=f"```\nAverage Time: {stats['average_time']}\nLast Update: {stats['last_update']}\nUptime: {stats['uptime']}\n```",
+            inline=False
+        )
+        
+        return embed
 
     async def cleanup(self):
-        """Cleanup resources dengan proper error handling"""
         try:
+            final_stats = self.stats.get_stats()
+            self.logger.info(f"Final LiveStock stats: {final_stats}")
+            
             if self.current_stock_message:
                 embed = discord.Embed(
                     title="🔧 Maintenance",
@@ -318,43 +405,46 @@ class LiveStockCog(commands.Cog):
         self.logger = logging.getLogger("LiveStockCog")
         self._ready = asyncio.Event()
         self.update_stock_task = None
+        self.stats_task = None
         self.logger.info("LiveStockCog instance created")
         asyncio.create_task(self.stock_manager.initialize())
 
-    async def start_tasks(self):
-        """Start background tasks safely"""
+    @commands.command(name="stockstats")
+    @commands.has_permissions(administrator=True)
+    async def stock_stats(self, ctx):
         try:
-            self.logger.info("Attempting to start stock update task...")
+            embed = await self.stock_manager.get_performance_embed()
+            await ctx.send(embed=embed)
+        except Exception as e:
+            self.logger.error(f"Error showing stats: {e}")
+            await ctx.send("Error retrieving stats")
+
+    async def start_tasks(self):
+        try:
+            self.logger.info("Starting stock update and stats tasks...")
             self.update_stock_task = self.update_stock.start()
-            self.logger.info("Stock update task started successfully")
+            self.stats_task = self.update_stats.start()
+            self.logger.info("All tasks started successfully")
         except Exception as e:
             self.logger.error(f"Failed to start tasks: {e}")
             raise
 
     async def cog_load(self):
-        """Setup when cog is loaded"""
         try:
             self.logger.info("LiveStockCog loading...")
-            
-            # Setup dasar tanpa menunggu bot ready
-            self._ready.set()  # Set ready flag awal
-            
-            # Schedule delayed setup
+            self._ready.set()
             self.bot.loop.create_task(self.delayed_setup())
             self.logger.info("LiveStockCog base loading complete")
-    
         except Exception as e:
             self.logger.error(f"Error in cog_load: {e}")
             raise
-    
+
     async def delayed_setup(self):
-        """Setup yang membutuhkan bot ready"""
         try:
             self.logger.info("Starting delayed setup...")
             
-            # Tunggu bot ready dengan timeout
             try:
-                async with asyncio.timeout(30):  # 30 detik timeout
+                async with asyncio.timeout(30):
                     self.logger.info("Waiting for bot to be ready...")
                     await self.bot.wait_until_ready()
                     self.logger.info("Bot is ready, proceeding with initialization...")
@@ -362,13 +452,11 @@ class LiveStockCog(commands.Cog):
                 self.logger.error("Timeout waiting for bot ready")
                 return
     
-            # Initialize channel
             channel = self.bot.get_channel(self.stock_manager.stock_channel_id)
             if not channel:
                 self.logger.error(f"Stock channel {self.stock_manager.stock_channel_id} not found")
                 return
             
-            # Start background tasks
             await self.start_tasks()
             self.logger.info("LiveStockCog fully initialized")
     
@@ -376,10 +464,11 @@ class LiveStockCog(commands.Cog):
             self.logger.error(f"Error in delayed setup: {e}")
 
     async def cog_unload(self):
-        """Cleanup when cog is unloaded"""
         try:
             if self.update_stock_task:
                 self.update_stock_task.cancel()
+            if self.stats_task:
+                self.stats_task.cancel()
             await self.stock_manager.cleanup()
             self.logger.info("LiveStockCog unloaded")
         except Exception as e:
@@ -387,7 +476,6 @@ class LiveStockCog(commands.Cog):
 
     @tasks.loop(seconds=UPDATE_INTERVAL.LIVE_STOCK)
     async def update_stock(self):
-        """Update stock display periodically"""
         if not self._ready.is_set():
             return
 
@@ -396,21 +484,33 @@ class LiveStockCog(commands.Cog):
         except Exception as e:
             self.logger.error(f"Error in stock update loop: {e}")
 
+    @tasks.loop(minutes=5.0)
+    async def update_stats(self):
+        if not self._ready.is_set():
+            return
+
+        try:
+            stats = self.stock_manager.stats.get_stats()
+            self.logger.info(f"LiveStock stats update: {stats}")
+        except Exception as e:
+            self.logger.error(f"Error updating stats: {e}")
+
     @update_stock.before_loop
     async def before_update_stock(self):
-        """Wait until bot is ready before starting the loop"""
+        await self.bot.wait_until_ready()
+
+    @update_stats.before_loop
+    async def before_update_stats(self):
         await self.bot.wait_until_ready()
 
 async def setup(bot):
-    """Setup cog dengan proper error handling"""
     try:
         if not hasattr(bot, COG_LOADED['LIVE_STOCK']):
             cog = LiveStockCog(bot)
             await bot.add_cog(cog)
             
-            # Tunggu stock manager ready
             try:
-                async with asyncio.timeout(5):  # 5 detik timeout
+                async with asyncio.timeout(5):
                     await cog.stock_manager._ready.wait()
             except asyncio.TimeoutError:
                 logging.error("Timeout waiting for stock manager initialization")
@@ -425,7 +525,6 @@ async def setup(bot):
         raise
 
 async def teardown(bot):
-    """Cleanup when extension is unloaded"""
     try:
         if hasattr(bot, COG_LOADED['LIVE_STOCK']):
             cog = bot.get_cog('LiveStockCog')
