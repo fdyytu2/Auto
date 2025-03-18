@@ -187,38 +187,46 @@ class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
                 await interaction.response.send_message(embed=error_embed, ephemeral=True)
                 
 class RegisterModal(Modal, BaseResponseHandler):
-    def __init__(self, existing_growid=None):
+    def __init__(self, balance_service: BalanceManagerService, existing_growid=None):
         title = "📝 Update GrowID" if existing_growid else "📝 Pendaftaran GrowID"
         super().__init__(title=title)
         BaseResponseHandler.__init__(self)
+        
+        # Tambahkan service langsung di constructor
+        self.balance_service = balance_service
+        self.existing_growid = existing_growid
         
         self.growid = TextInput(
             label="Masukkan GrowID Anda",
             placeholder=f"GrowID saat ini: {existing_growid}" if existing_growid else "Contoh: GROW_ID",
             min_length=3,
             max_length=30,
-            required=True
+            required=True,
+            style=discord.TextStyle.short
         )
         self.add_item(self.growid)
-        self.existing_growid = existing_growid
 
     async def on_submit(self, interaction: discord.Interaction):
-        response_sent = False
         try:
             # Defer response
-            if not interaction.response.is_done():
-                await interaction.response.defer(ephemeral=True)
-                response_sent = True
-
-            balance_service = BalanceManagerService(interaction.client)
+            await interaction.response.defer(ephemeral=True)
+            
+            # Validate input
             growid = str(self.growid.value).strip()
-
-            # Validasi input
             if not growid or len(growid) < 3:
                 raise ValueError(MESSAGES.ERROR['INVALID_GROWID'])
 
-            # Registrasi user
-            register_response = await balance_service.register_user(
+            # Validasi format GrowID
+            if not self.validate_growid_format(growid):
+                raise ValueError(MESSAGES.ERROR['INVALID_GROWID_FORMAT'])
+
+            # Cek blacklist
+            blacklist_check = await self.balance_service.check_blacklist(growid)
+            if blacklist_check:
+                raise ValueError(MESSAGES.ERROR['GROWID_BLACKLISTED'])
+
+            # Register/Update user
+            register_response = await self.balance_service.register_user(
                 str(interaction.user.id),
                 growid
             )
@@ -226,54 +234,84 @@ class RegisterModal(Modal, BaseResponseHandler):
             if not register_response.success:
                 raise ValueError(register_response.error)
 
-            # Format pesan sukses
-            title = "✅ GrowID Diperbarui" if self.existing_growid else "✅ Pendaftaran Berhasil"
-            description = (
-                f"GrowID berhasil diperbarui!\nGrowID Lama: {self.existing_growid}\nGrowID Baru: {growid}"
-                if self.existing_growid else 
-                MESSAGES.SUCCESS['REGISTRATION'].format(growid=growid)
-            )
-
+            # Format success message
             embed = discord.Embed(
-                title=title,
-                description=description,
-                color=COLORS.SUCCESS
+                title="✅ GrowID Diperbarui" if self.existing_growid else "✅ Pendaftaran Berhasil",
+                description=self.format_success_message(growid),
+                color=COLORS.SUCCESS,
+                timestamp=datetime.utcnow()
             )
-            
-            # Tambah info balance jika ada
-            if register_response.data and 'balance' in register_response.data:
-                embed.add_field(
-                    name="Saldo Awal",
-                    value=f"```\n{register_response.data['balance'].format()}\n```",
-                    inline=False
-                )
 
-            embed.set_footer(text="Terima kasih telah mendaftar!")
-            embed.timestamp = datetime.utcnow()
+            # Add balance info if available
+            if register_response.data and isinstance(register_response.data, dict):
+                if 'balance' in register_response.data:
+                    embed.add_field(
+                        name="Saldo Awal",
+                        value=f"```yml\n{register_response.data['balance'].format()}```",
+                        inline=False
+                    )
 
+            # Add footer
+            embed.set_footer(
+                text="Silakan gunakan tombol 💰 Saldo untuk melihat saldo Anda"
+            )
+
+            # Send response
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except ValueError as e:
-            error_embed = discord.Embed(
-                title="❌ Error",
-                description=str(e),
-                color=COLORS.ERROR
-            )
-            if response_sent:
-                await interaction.followup.send(embed=error_embed, ephemeral=True)
-            else:
-                await interaction.response.send_message(embed=error_embed, ephemeral=True)
-        
+            await self.handle_error(interaction, str(e))
         except Exception as e:
-            error_embed = discord.Embed(
-                title="❌ Error",
-                description=MESSAGES.ERROR['REGISTRATION_FAILED'],
-                color=COLORS.ERROR
+            logger.error(f"Error in register modal: {e}")
+            await self.handle_error(
+                interaction, 
+                MESSAGES.ERROR['REGISTRATION_FAILED']
             )
-            if response_sent:
-                await interaction.followup.send(embed=error_embed, ephemeral=True)
-            else:
-                await interaction.response.send_message(embed=error_embed, ephemeral=True)
+
+    def validate_growid_format(self, growid: str) -> bool:
+        """Validasi format GrowID"""
+        # Minimal 3 karakter, maksimal 30
+        if len(growid) < 3 or len(growid) > 30:
+            return False
+            
+        # Hanya boleh mengandung huruf, angka, dan underscore
+        import re
+        if not re.match(r'^[a-zA-Z0-9_]+$', growid):
+            return False
+            
+        return True
+
+    def format_success_message(self, new_growid: str) -> str:
+        """Format pesan sukses"""
+        if self.existing_growid:
+            return (
+                f"GrowID berhasil diperbarui!\n\n"
+                f"**GrowID Lama**: `{self.existing_growid}`\n"
+                f"**GrowID Baru**: `{new_growid}`"
+            )
+        else:
+            return (
+                f"GrowID berhasil didaftarkan!\n\n"
+                f"**GrowID**: `{new_growid}`\n\n"
+                "Silakan gunakan tombol 💰 Saldo untuk melihat saldo Anda"
+            )
+
+    async def handle_error(self, interaction: discord.Interaction, error_message: str):
+        """Handle error responses"""
+        error_embed = discord.Embed(
+            title="❌ Error",
+            description=error_message,
+            color=COLORS.ERROR,
+            timestamp=datetime.utcnow()
+        )
+        try:
+            await interaction.followup.send(embed=error_embed, ephemeral=True)
+        except:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    embed=error_embed,
+                    ephemeral=True
+                )
                 
 class ShopView(View, BaseLockHandler, BaseResponseHandler):
     def __init__(self, bot):
@@ -315,10 +353,13 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
 
     @discord.ui.button(
         style=discord.ButtonStyle.primary,
-        label="📝 Daftar/Update",
+        label="📝 Set Grow ID",
         custom_id=BUTTON_IDS.REGISTER
     )
     async def register_callback(self, interaction: discord.Interaction, button: Button):
+        """Callback untuk tombol registrasi/update GrowID"""
+        
+        # Lock untuk mencegah spam
         if not await self.acquire_response_lock(interaction):
             if not interaction.response.is_done():
                 await interaction.response.send_message(
@@ -336,44 +377,88 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
             if await self.admin_service.is_maintenance_mode():
                 raise ValueError(MESSAGES.INFO['MAINTENANCE'])
     
-            # Get existing GrowID
+            # Check rate limit (opsional)
+            rate_limit_key = f"register_limit_{interaction.user.id}"
+            if await self.cache_manager.get(rate_limit_key):
+                raise ValueError(MESSAGES.ERROR['RATE_LIMIT'])
+    
+            # Check user blacklist status
+            blacklist_check = await self.admin_service.check_blacklist(str(interaction.user.id))
+            if blacklist_check and blacklist_check.success and blacklist_check.data:
+                self.logger.warning(f"Blacklisted user {interaction.user.id} attempted registration")
+                raise ValueError(MESSAGES.ERROR['USER_BLACKLISTED'])
+    
+            # Get existing GrowID jika ada
             growid_response = await self.balance_service.get_growid(str(interaction.user.id))
             existing_growid = None
             if growid_response.success and growid_response.data:
                 existing_growid = growid_response.data
+                self.logger.info(f"Update GrowID attempt from {interaction.user.id} (Current: {existing_growid})")
+            else:
+                self.logger.info(f"New registration attempt from {interaction.user.id}")
     
-            # Check if user is blacklisted
-            blacklist_check = await self.admin_service.check_blacklist(str(interaction.user.id))
-            if blacklist_check.success and blacklist_check.data:
-                raise ValueError(MESSAGES.ERROR['USER_BLACKLISTED'])
-    
-            # Send registration modal
-            modal = RegisterModal(existing_growid=existing_growid)
+            # Buat dan kirim modal
+            modal = RegisterModal(
+                balance_service=self.balance_service,  # Pass service langsung
+                existing_growid=existing_growid
+            )
+            
+            # Kirim modal
             await interaction.response.send_modal(modal)
+    
+            # Set rate limit jika diperlukan
+            await self.cache_manager.set(
+                rate_limit_key,
+                True,
+                expires_in=300  # 5 menit cooldown
+            )
     
         except ValueError as e:
             if not interaction.response.is_done():
+                error_embed = discord.Embed(
+                    title="❌ Error",
+                    description=str(e),
+                    color=COLORS.ERROR,
+                    timestamp=datetime.utcnow()
+                )
+                error_embed.set_footer(text="Silakan coba lagi nanti")
                 await interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="❌ Error",
-                        description=str(e),
-                        color=COLORS.ERROR
-                    ),
+                    embed=error_embed,
                     ephemeral=True
                 )
+    
         except Exception as e:
-            self.logger.error(f"Error in register callback: {e}")
+            self.logger.error(f"Error in register callback for user {interaction.user.id}: {e}")
             if not interaction.response.is_done():
+                error_embed = discord.Embed(
+                    title="❌ Error",
+                    description=MESSAGES.ERROR['REGISTRATION_FAILED'],
+                    color=COLORS.ERROR,
+                    timestamp=datetime.utcnow()
+                )
+                error_embed.add_field(
+                    name="Detail",
+                    value="Terjadi kesalahan sistem. Mohon coba lagi nanti.",
+                    inline=False
+                )
+                error_embed.set_footer(text="Jika masalah berlanjut, hubungi admin")
                 await interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="❌ Error",
-                        description=MESSAGES.ERROR['REGISTRATION_FAILED'],
-                        color=COLORS.ERROR
-                    ),
+                    embed=error_embed,
                     ephemeral=True
                 )
         finally:
+            # Cleanup
             self.release_response_lock(interaction)
+            try:
+                # Trigger callback jika diperlukan
+                await self.callback_manager.trigger(
+                    'registration_attempt',
+                    user_id=str(interaction.user.id),
+                    existing_growid=existing_growid,
+                    timestamp=datetime.utcnow()
+                )
+            except Exception as e:
+                self.logger.error(f"Error in register callback cleanup: {e}")
 
     @discord.ui.button(
         style=discord.ButtonStyle.success,
