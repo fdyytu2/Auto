@@ -200,6 +200,31 @@ class EXTENSIONS:
             'TransactionCog'
         ]
         return all(bot.get_cog(service) for service in required_services)
+        
+class LIMITS:
+    """Transaction and system limits"""
+    DEFAULT_DAILY_LIMIT = 1_000_000  # 1M WL default daily limit
+    MAX_PURCHASE_QUANTITY = 999      # Maximum items per purchase
+    MAX_DAILY_TRANSACTIONS = 100     # Maximum transactions per day
+    MIN_PURCHASE_AMOUNT = 1          # Minimum purchase amount
+    MAX_TRANSFER_AMOUNT = 10_000_000 # Maximum transfer amount (10M WL)
+    MAX_DEPOSIT_AMOUNT = 100_000_000 # Maximum deposit amount (100M WL)
+    COOLDOWN_SECONDS = 3             # Cooldown between transactions
+    MAX_FAILED_ATTEMPTS = 5          # Maximum failed attempts before temporary block
+    BLOCK_DURATION = 30              # Minutes to block after max failed attempts
+    SUSPICIOUS_THRESHOLD = 50_000    # Amount that triggers extra verification
+    
+    @classmethod
+    def get_daily_usage_limit(cls, user_level: int) -> int:
+        """Get daily usage limit based on user level"""
+        limits = {
+            0: cls.DEFAULT_DAILY_LIMIT,    # Default
+            1: cls.DEFAULT_DAILY_LIMIT * 2, # VIP
+            2: cls.DEFAULT_DAILY_LIMIT * 5, # Premium
+            3: cls.DEFAULT_DAILY_LIMIT * 10 # Admin
+        }
+        return limits.get(user_level, cls.DEFAULT_DAILY_LIMIT)
+
 
 # Currency Settings
 class CURRENCY_RATES:
@@ -304,6 +329,7 @@ class MESSAGES:
         'CACHE_CLEARED': "✅ Cache cleared successfully.",
         'COG_LOADED': "✅ {} loaded successfully.",
         'SYNC_SUCCESS': "✅ Components synchronized successfully.",  # New
+        'REGISTRATION': "✅ Registrasi berhasil! GrowID: {growid}",
         'RECOVERY_SUCCESS': "✅ System recovered successfully."      # New
     }
     
@@ -330,7 +356,11 @@ class MESSAGES:
         'LOCK_ACQUISITION_FAILED': "❌ Could not acquire lock. Please try again.",
         'DISPLAY_ERROR': "❌ Terjadi kesalahan pada display sistem",  # New
         'SYNC_ERROR': "❌ Gagal mensinkronkan komponen sistem",       # New
-        'INITIALIZATION_ERROR': "❌ Gagal menginisialisasi sistem"    # New
+        'INITIALIZATION_ERROR': "❌ Gagal menginisialisasi sistem",
+        'INVALID_GROWID_FORMAT': "❌ Format GrowID tidak valid. Harus diawali huruf dan tidak boleh mengandung karakter khusus",
+        'GROWID_EXISTS': "❌ GrowID ini sudah terdaftar dengan akun lain",
+        'RATE_LIMIT': "❌ Mohon tunggu 5 menit sebelum mencoba mendaftar lagi",
+        'USER_BLACKLISTED': "❌ Akun Anda tidak diizinkan untuk melakukan pendaftaran"
     }
     
     INFO = {
