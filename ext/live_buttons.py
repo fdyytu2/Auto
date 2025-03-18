@@ -45,23 +45,24 @@ from .trx import TransactionManager
 from .admin_service import AdminService
 
 logger = logging.getLogger(__name__)
+
 class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
-    def __init__(self, products: List[Dict], balance_service, product_service, trx_manager):
+    def __init__(self, products: List[Dict], balance_service, product_service, trx_manager, cache_manager):
         super().__init__(title="🛍️ Pembelian Produk")
         self.products_cache = {p['code']: p for p in products}
         self.balance_service = balance_service
         self.product_service = product_service
         self.trx_manager = trx_manager
+        self.cache_manager = cache_manager
         BaseResponseHandler.__init__(self)
-
-        # Format product list
+        
         product_list = "\n".join([
-            f"{p['name']} ({p['code']}) - {p['price']} WL | Stok: {p['stock']}"
+            f"{p['name']} ({p['code']}) - {p['price']:,} WL | Stok: {p['stock']}"
             for p in products
         ])
 
         self.product_info = discord.ui.TextInput(
-            label="Daftar Produk (Kode dalam kurung)",
+            label="Daftar Produk",
             style=discord.TextStyle.paragraph,
             default=product_list,
             required=False,
@@ -71,7 +72,7 @@ class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
         self.product_code = discord.ui.TextInput(
             label="Kode Produk",
             style=discord.TextStyle.short,
-            placeholder="Masukkan kode produk yang ingin dibeli",
+            placeholder="Masukkan kode produk",
             required=True,
             min_length=1,
             max_length=10,
@@ -81,7 +82,7 @@ class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
         self.quantity = discord.ui.TextInput(
             label="Jumlah",
             style=discord.TextStyle.short,
-            placeholder="Masukkan jumlah yang ingin dibeli",
+            placeholder="Masukkan jumlah (1-999)",
             required=True,
             min_length=1,
             max_length=3,
@@ -95,37 +96,53 @@ class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
     async def on_submit(self, interaction: discord.Interaction):
         response_sent = False
         try:
-            # Defer response
-            if not interaction.response.is_done():
-                await interaction.response.defer(ephemeral=True)
-                response_sent = True
+            # Rate limit check
+            rate_limit_key = f"purchase_limit_{interaction.user.id}"
+            if await self.cache_manager.get(rate_limit_key):
+                raise ValueError(MESSAGES.ERROR['RATE_LIMIT'])
+
+            await interaction.response.defer(ephemeral=True)
+            response_sent = True
+
+            # Set rate limit
+            await self.cache_manager.set(
+                rate_limit_key,
+                True,
+                expires_in=300  # 5 menit cooldown
+            )
 
             # Validate input
             product_code = self.product_code.value.strip().upper()
             try:
                 quantity = int(self.quantity.value)
+                if quantity <= 0 or quantity > 999:
+                    raise ValueError(MESSAGES.ERROR['INVALID_AMOUNT'])
             except ValueError:
                 raise ValueError(MESSAGES.ERROR['INVALID_AMOUNT'])
 
-            # Validate product
-            if product_code not in self.products_cache:
-                raise ValueError(f"Produk dengan kode '{product_code}' tidak ditemukan")
-            
-            selected_product = self.products_cache[product_code]
+            # Get GrowID for cache invalidation later
+            growid_response = await self.balance_service.get_growid(str(interaction.user.id))
+            if not growid_response.success:
+                raise ValueError(growid_response.error)
+            growid = growid_response.data
 
-            # Validate stock
-            stock_response = await self.product_service.get_stock_count(product_code)
-            if not stock_response.success:
-                raise ValueError(stock_response.error)
+            # Process purchase dengan queue untuk transaksi besar
+            if quantity > 10:  # Threshold untuk queue
+                await self.trx_manager.transaction_queue.add_transaction({
+                    'type': TransactionType.PURCHASE.value,
+                    'user_id': str(interaction.user.id),
+                    'product_code': product_code,
+                    'quantity': quantity
+                })
+                embed = discord.Embed(
+                    title="⏳ Transaksi Diproses",
+                    description="Transaksi Anda sedang diproses. Anda akan mendapat notifikasi setelah selesai.",
+                    color=COLORS.WARNING
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
 
-            current_stock = stock_response.data
-            if current_stock <= 0:
-                raise ValueError(MESSAGES.ERROR['OUT_OF_STOCK'])
-            
-            if quantity <= 0 or quantity > current_stock:
-                raise ValueError(MESSAGES.ERROR['INVALID_AMOUNT'])
-
-            # Process purchase
+            # Process purchase untuk transaksi normal
             purchase_response = await self.trx_manager.process_purchase(
                 buyer_id=str(interaction.user.id),
                 product_code=product_code,
@@ -138,29 +155,48 @@ class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
             # Create success embed
             embed = discord.Embed(
                 title="✅ Pembelian Berhasil",
-                description=purchase_response.message,
-                color=COLORS.SUCCESS
+                color=COLORS.SUCCESS,
+                timestamp=datetime.utcnow()
             )
-
-            # Add product details
-            if purchase_response.data and 'content' in purchase_response.data:
-                content_text = "\n".join(purchase_response.data['content'])
-                embed.add_field(
-                    name="Detail Produk",
-                    value=f"```\n{content_text}\n```",
-                    inline=False
+            
+            # Add transaction details
+            if purchase_response.data:
+                product_data = purchase_response.data.get('product', {})
+                embed.description = (
+                    f"Berhasil membeli {quantity}x {product_data.get('name', '')}\n"
+                    f"Total: {purchase_response.data.get('total_price', 0):,} WL"
                 )
+                
+                if 'content' in purchase_response.data:
+                    content_text = "\n".join(purchase_response.data['content'])
+                    embed.add_field(
+                        name="Detail Produk",
+                        value=f"```\n{content_text}\n```",
+                        inline=False
+                    )
 
             # Add balance info
             if purchase_response.balance_response and purchase_response.balance_response.data:
                 embed.add_field(
-                    name="Saldo Baru",
-                    value=f"```\n{purchase_response.balance_response.data.format()}\n```",
+                    name="Saldo Tersisa",
+                    value=f"```yml\n{purchase_response.balance_response.data.format()}```",
                     inline=False
                 )
 
-            embed.set_footer(text="Terima kasih telah berbelanja!")
-            embed.timestamp = datetime.utcnow()
+            # Add performance info if available
+            if hasattr(purchase_response, 'performance') and purchase_response.performance:
+                perf_data = purchase_response.performance
+                perf_text = f"Processing Time: {perf_data.get('total_time', 0):.2f}s"
+                embed.set_footer(text=perf_text)
+
+            # Invalidate related caches
+            cache_keys = [
+                f"balance_{growid}",
+                f"stock_{product_code}",
+                f"history_{interaction.user.id}"
+            ]
+            for key in cache_keys:
+                await self.cache_manager.delete(key)
 
             await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -168,14 +204,23 @@ class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
             error_embed = discord.Embed(
                 title="❌ Error",
                 description=str(e),
-                color=COLORS.ERROR
+                color=COLORS.ERROR,
+                timestamp=datetime.utcnow()
             )
             if response_sent:
                 await interaction.followup.send(embed=error_embed, ephemeral=True)
             else:
                 await interaction.response.send_message(embed=error_embed, ephemeral=True)
-        
+
         except Exception as e:
+            self.logger.error(f"Error processing purchase: {e}")
+            
+            # Error recovery untuk transaksi gagal
+            if 'purchase_response' in locals():
+                await self.trx_manager.recover_failed_transaction(
+                    purchase_response.data.get('transaction_id')
+                )
+                
             error_embed = discord.Embed(
                 title="❌ Error",
                 description=MESSAGES.ERROR['TRANSACTION_FAILED'],
@@ -185,6 +230,11 @@ class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
                 await interaction.followup.send(embed=error_embed, ephemeral=True)
             else:
                 await interaction.response.send_message(embed=error_embed, ephemeral=True)
+
+        finally:
+            await self.cache_manager.cleanup()
+
+
                 
 class RegisterModal(Modal, BaseResponseHandler):
     def __init__(self, balance_service: BalanceManagerService, existing_growid=None):
@@ -411,125 +461,138 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
                 )
             except Exception as e:
                 self.logger.error(f"Error in register callback cleanup: {e}")
-        @discord.ui.button(
-            style=discord.ButtonStyle.success,
-            label="💰 Saldo",
-            custom_id=BUTTON_IDS.BALANCE
-        )
-        async def balance_callback(self, interaction: discord.Interaction, button: Button):
-            if not await self.acquire_response_lock(interaction):
-                if not interaction.response.is_done():  # Cek apakah sudah direspon
-                    await interaction.response.send_message(
-                        embed=discord.Embed(
-                            title="⏳ Mohon Tunggu",
-                            description=MESSAGES.INFO['COOLDOWN'],
-                            color=COLORS.WARNING
-                        ),
-                        ephemeral=True
-                    )
-                return
-        
-            response_sent = False
-            try:
-                # Check maintenance mode
-                if await self.admin_service.is_maintenance_mode():
-                    raise ValueError(MESSAGES.INFO['MAINTENANCE'])
-        
-                # Defer response jika belum direspon
-                if not interaction.response.is_done():
-                    await interaction.response.defer(ephemeral=True)
-                    response_sent = True
-        
-                # Get user's GrowID
-                growid_response = await self.balance_service.get_growid(str(interaction.user.id))
-                if not growid_response.success:
-                    raise ValueError(growid_response.error)
-        
-                growid = growid_response.data
-                if not growid:
-                    raise ValueError(MESSAGES.ERROR['NOT_REGISTERED'])
-        
-                # Get balance
-                balance_response = await self.balance_service.get_balance(growid)
-                if not balance_response.success:
-                    raise ValueError(balance_response.error)
-        
-                balance = balance_response.data
-        
-                # Create embed
-                embed = discord.Embed(
-                    title="💰 Informasi Saldo",
-                    description=f"Saldo untuk `{growid}`",
-                    color=COLORS.INFO
-                )
-        
-                embed.add_field(
-                    name="Saldo Saat Ini",
-                    value=f"```yml\n{balance.format()}```",
-                    inline=False
-                )
-        
-                # Get transaction history
-                trx_response = await self.trx_manager.get_transaction_history(growid, limit=3)
-                if trx_response.success and trx_response.data:
-                    transactions = trx_response.data
-                    trx_details = []
-                    for trx in transactions:
-                        try:
-                            trx_details.append(
-                                f"• {trx['type']}: {trx['change']} - {trx['details']}"
-                            )
-                        except Exception:
-                            continue
-        
-                    if trx_details:
-                        embed.add_field(
-                            name="Transaksi Terakhir",
-                            value=f"```yml\n{chr(10).join(trx_details)}```",
-                            inline=False
+                
+    @discord.ui.button(
+        style=discord.ButtonStyle.success,
+        label="💰 Saldo",
+        custom_id=BUTTON_IDS.BALANCE
+    )
+    async def balance_callback(self, interaction: discord.Interaction, button: Button):
+        if not await self.acquire_response_lock(interaction):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="⏳ Mohon Tunggu",
+                    description=MESSAGES.INFO['COOLDOWN'],
+                    color=COLORS.WARNING
+                ),
+                ephemeral=True
+            )
+            return
+    
+        response_sent = False
+        try:
+            # Check maintenance mode
+            if await self.admin_service.is_maintenance_mode():
+                raise ValueError(MESSAGES.INFO['MAINTENANCE'])
+    
+            # Defer response
+            await interaction.response.defer(ephemeral=True)
+            response_sent = True
+    
+            # Get GrowID
+            growid_response = await self.balance_service.get_growid(str(interaction.user.id))
+            if not growid_response.success:
+                raise ValueError(growid_response.error)
+    
+            growid = growid_response.data
+            if not growid:
+                raise ValueError(MESSAGES.ERROR['NOT_REGISTERED'])
+    
+            # Get balance from balance manager
+            balance_response = await self.balance_service.get_balance(growid)
+            if not balance_response.success:
+                raise ValueError(balance_response.error)
+            
+            balance = balance_response.data
+    
+            # Create embed
+            embed = discord.Embed(
+                title="💰 Informasi Saldo",
+                description=f"Saldo untuk `{growid}`",
+                color=COLORS.INFO,
+                timestamp=datetime.utcnow()
+            )
+    
+            embed.add_field(
+                name="Saldo Saat Ini",
+                value=f"```yml\n{balance.format()}```",
+                inline=False
+            )
+    
+            # Get transaction history from balance manager
+            history_response = await self.balance_service.get_transaction_history(
+                growid,
+                limit=3
+            )
+    
+            if history_response.success and history_response.data:
+                transactions = []
+                for trx in history_response.data:
+                    try:
+                        # Get emoji based on transaction type
+                        type_emoji = {
+                            TransactionType.DEPOSIT.value: '💰',
+                            TransactionType.PURCHASE.value: '🛒',
+                            TransactionType.WITHDRAWAL.value: '💸',
+                            TransactionType.TRANSFER.value: '↔️',
+                            TransactionType.ADMIN_ADD.value: '⚡',
+                            TransactionType.ADMIN_REMOVE.value: '❌',
+                        }.get(trx['type'], '💱')
+    
+                        # Format transaction details
+                        transactions.append(
+                            f"{type_emoji} {trx['type']}: {trx.get('amount_wl', 0):,} WL - {trx['details']}"
                         )
-        
-                embed.set_footer(text="Diperbarui")
-                embed.timestamp = datetime.utcnow()
-        
-                # Send response
-                if response_sent:
-                    await interaction.followup.send(embed=embed, ephemeral=True)
-                elif not interaction.response.is_done():
-                    await interaction.response.send_message(embed=embed, ephemeral=True)
-        
-            except ValueError as e:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        embed=discord.Embed(
-                            title="❌ Error",
-                            description=str(e),
-                            color=COLORS.ERROR
-                        ),
-                        ephemeral=True
+                    except Exception as e:
+                        self.logger.error(f"Error formatting transaction: {e}")
+                        continue
+    
+                if transactions:
+                    embed.add_field(
+                        name="Transaksi Terakhir",
+                        value="```yml\n" + "\n".join(transactions) + "\n```",
+                        inline=False
                     )
-                elif response_sent:
-                    await interaction.followup.send(
-                        embed=discord.Embed(
-                            title="❌ Error",
-                            description=str(e),
-                            color=COLORS.ERROR
-                        ),
-                        ephemeral=True
-                    )
-            except Exception as e:
-                self.logger.error(f"Error in balance callback: {e}")
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        embed=discord.Embed(
-                            title="❌ Error",
-                            description=MESSAGES.ERROR['BALANCE_FAILED'],
-                            color=COLORS.ERROR
-                        ),
-                        ephemeral=True
-                    )
-            finally:
-                self.release_response_lock(interaction)
+    
+            # Get daily limit info
+            daily_limit = await self.balance_service.get_daily_limit(growid)
+            daily_usage = await self.balance_service.get_daily_usage(growid)
+            
+            embed.add_field(
+                name="Limit Harian",
+                value=f"```yml\nDigunakan: {daily_usage:,}/{daily_limit:,} WL```",
+                inline=False
+            )
+    
+            embed.set_footer(text=f"Diperbarui • Sisa limit: {daily_limit - daily_usage:,} WL")
+    
+            await interaction.followup.send(embed=embed, ephemeral=True)
+    
+        except ValueError as e:
+            error_embed = discord.Embed(
+                title="❌ Error",
+                description=str(e),
+                color=COLORS.ERROR
+            )
+            if response_sent:
+                await interaction.followup.send(embed=error_embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=error_embed, ephemeral=True)
+    
+        except Exception as e:
+            self.logger.error(f"Error in balance callback: {e}")
+            error_embed = discord.Embed(
+                title="❌ Error",
+                description=MESSAGES.ERROR['BALANCE_FAILED'],
+                color=COLORS.ERROR
+            )
+            if response_sent:
+                await interaction.followup.send(embed=error_embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=error_embed, ephemeral=True)
+    
+        finally:
+            self.release_response_lock(interaction)
                 
     @discord.ui.button(
         style=discord.ButtonStyle.secondary,
@@ -538,127 +601,140 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
     )
     async def world_info_callback(self, interaction: discord.Interaction, button: Button):
         if not await self.acquire_response_lock(interaction):
-            try:
-                await interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="⏳ Mohon Tunggu",
-                        description=MESSAGES.INFO['COOLDOWN'],
-                        color=COLORS.WARNING
-                    ),
-                    ephemeral=True
-                )
-            except discord.errors.InteractionResponded:
-                await interaction.followup.send(
-                    embed=discord.Embed(
-                        title="⏳ Mohon Tunggu",
-                        description=MESSAGES.INFO['COOLDOWN'],
-                        color=COLORS.WARNING
-                    ),
-                    ephemeral=True
-                )
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="⏳ Mohon Tunggu",
+                    description=MESSAGES.INFO['COOLDOWN'],
+                    color=COLORS.WARNING
+                ),
+                ephemeral=True
+            )
             return
     
+        response_sent = False
         try:
-            response_sent = False
-            
             # Check maintenance mode
             if await self.admin_service.is_maintenance_mode():
                 raise ValueError(MESSAGES.INFO['MAINTENANCE'])
     
             # Defer response
-            try:
-                await interaction.response.defer(ephemeral=True)
-                response_sent = True
-            except discord.errors.InteractionResponded:
-                response_sent = True
-            except Exception:
-                pass
+            await interaction.response.defer(ephemeral=True)
+            response_sent = True
     
-            # Get world info
+            # Get world info from product manager
             world_response = await self.product_service.get_world_info()
             if not world_response.success:
                 raise ValueError(world_response.error)
     
             world_info = world_response.data
-            
-            # Format status dengan emoji
+    
+            # Create embed with proper formatting
+            embed = discord.Embed(
+                title="🌎 World Information",
+                color=COLORS.INFO,
+                timestamp=datetime.utcnow()
+            )
+    
+            # Status emoji mapping from product manager
             status_emoji = {
                 'online': '🟢',
-                'offline': '🔴',
+                'offline': '🔴', 
                 'maintenance': '🔧',
                 'busy': '🟡',
                 'full': '🔵'
             }
             
+            # Get current status with emoji
             status = world_info.get('status', '').lower()
             status_display = f"{status_emoji.get(status, '❓')} {status.upper()}"
     
-            # Create embed
-            embed = discord.Embed(
-                title="🌎 World Information",
-                color=COLORS.INFO
-            )
-    
-            # Basic info dalam format yang rapi
-            basic_info = [
+            # Format world details with proper spacing
+            world_details = [
                 f"{'World':<12}: {world_info.get('world', 'N/A')}",
                 f"{'Owner':<12}: {world_info.get('owner', 'N/A')}",
                 f"{'Bot':<12}: {world_info.get('bot', 'N/A')}",
                 f"{'Status':<12}: {status_display}"
             ]
-            
+    
             embed.add_field(
-                name="Basic Info",
-                value="```" + "\n".join(basic_info) + "```",
+                name="World Details",
+                value="```\n" + "\n".join(world_details) + "\n```",
                 inline=False
             )
     
-            # Last updated
-            updated_at = world_info.get('updated_at')
-            if updated_at:
+            # Add additional info if available
+            if features := world_info.get('features'):
+                embed.add_field(
+                    name="Features",
+                    value="```yml\n" + "\n".join(features) + "\n```",
+                    inline=False
+                )
+    
+            # Add last update info
+            if updated_at := world_info.get('updated_at'):
                 try:
                     dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
                     last_update = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
                     embed.set_footer(text=f"Last Updated: {last_update}")
                 except:
-                    pass
+                    embed.set_footer(text="Last Updated: Unknown")
     
-            # Send response
-            if response_sent:
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            else:
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
     
         except ValueError as e:
-            await self._send_error_response(interaction, str(e), response_sent)
+            error_embed = discord.Embed(
+                title="❌ Error",
+                description=str(e),
+                color=COLORS.ERROR
+            )
+            if response_sent:
+                await interaction.followup.send(embed=error_embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=error_embed, ephemeral=True)
+    
         except Exception as e:
             self.logger.error(f"Error in world info callback: {e}")
-            await self._send_error_response(
-                interaction,
-                MESSAGES.ERROR['WORLD_INFO_FAILED'],
-                response_sent
+            error_embed = discord.Embed(
+                title="❌ Error",
+                description=MESSAGES.ERROR['WORLD_INFO_FAILED'],
+                color=COLORS.ERROR
             )
+            if response_sent:
+                await interaction.followup.send(embed=error_embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(error_embed, ephemeral=True)
+    
         finally:
             self.release_response_lock(interaction)
+            
     @discord.ui.button(
         style=discord.ButtonStyle.success,
-        label="🛒 Beli",
+        label="🛒 Buy",
         custom_id=BUTTON_IDS.BUY
     )
     async def buy_callback(self, interaction: discord.Interaction, button: Button):
         if not await self.acquire_response_lock(interaction):
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="⏳ Mohon Tunggu",
-                        description=MESSAGES.INFO['COOLDOWN'],
-                        color=COLORS.WARNING
-                    ),
-                    ephemeral=True
-                )
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="⏳ Mohon Tunggu",
+                    description=MESSAGES.INFO['COOLDOWN'],
+                    color=COLORS.WARNING
+                ),
+                ephemeral=True
+            )
             return
     
         try:
+            # Rate limit check
+            rate_limit_key = f"buy_button_{interaction.user.id}"
+            if await self.cache_manager.get(rate_limit_key):
+                raise ValueError(MESSAGES.ERROR['RATE_LIMIT'])
+    
+            # Queue check
+            queue_size = self.trx_manager.transaction_queue.queue.qsize()
+            if queue_size > 50:  # Max queue size
+                raise ValueError(MESSAGES.ERROR['SYSTEM_BUSY'])
+    
             # Check maintenance mode
             if await self.admin_service.is_maintenance_mode():
                 raise ValueError(MESSAGES.INFO['MAINTENANCE'])
@@ -668,17 +744,22 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
             if blacklist_check.success and blacklist_check.data:
                 raise ValueError(MESSAGES.ERROR['USER_BLACKLISTED'])
     
-            # Verify user registration
+            # Verify user registration first
             growid_response = await self.balance_service.get_growid(str(interaction.user.id))
             if not growid_response.success:
                 raise ValueError(growid_response.error)
     
-            # Get and validate products
+            # Get balance dan cek limit harian
+            balance_response = await self.balance_service.get_balance(growid_response.data)
+            if not balance_response.success:
+                raise ValueError(balance_response.error)
+    
+            # Get and validate available products
             product_response = await self.product_service.get_all_products()
             if not product_response.success or not product_response.data:
                 raise ValueError(MESSAGES.ERROR['NO_PRODUCTS'])
     
-            # Filter available products
+            # Filter available products with stock
             available_products = []
             for product in product_response.data:
                 stock_response = await self.product_service.get_stock_count(product['code'])
@@ -689,38 +770,46 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
             if not available_products:
                 raise ValueError(MESSAGES.ERROR['OUT_OF_STOCK'])
     
-            # Send purchase modal
+            # Show purchase modal with cache manager
             modal = PurchaseModal(
                 available_products,
                 self.balance_service,
                 self.product_service,
-                self.trx_manager
+                self.trx_manager,
+                self.cache_manager
             )
+    
+            # Set rate limit
+            await self.cache_manager.set(
+                rate_limit_key,
+                True,
+                expires_in=60  # 1 menit cooldown
+            )
+    
             await interaction.response.send_modal(modal)
     
         except ValueError as e:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="❌ Error",
-                        description=str(e),
-                        color=COLORS.ERROR
-                    ),
-                    ephemeral=True
-                )
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description=str(e),
+                    color=COLORS.ERROR
+                ),
+                ephemeral=True
+            )
         except Exception as e:
             self.logger.error(f"Error in buy callback: {e}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="❌ Error",
-                        description=MESSAGES.ERROR['TRANSACTION_FAILED'],
-                        color=COLORS.ERROR
-                    ),
-                    ephemeral=True
-                )
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description=MESSAGES.ERROR['TRANSACTION_FAILED'],
+                    color=COLORS.ERROR
+                ),
+                ephemeral=True
+            )
         finally:
             self.release_response_lock(interaction)
+            await self.cache_manager.cleanup()
             
     @discord.ui.button(
         style=discord.ButtonStyle.secondary,
@@ -729,50 +818,42 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
     )
     async def history_callback(self, interaction: discord.Interaction, button: Button):
         if not await self.acquire_response_lock(interaction):
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="⏳ Mohon Tunggu",
-                        description=MESSAGES.INFO['COOLDOWN'],
-                        color=COLORS.WARNING
-                    ),
-                    ephemeral=True
-                )
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="⏳ Mohon Tunggu",
+                    description=MESSAGES.INFO['COOLDOWN'],
+                    color=COLORS.WARNING
+                ),
+                ephemeral=True
+            )
             return
     
         try:
-            response_sent = False
-            
             # Check maintenance mode
             if await self.admin_service.is_maintenance_mode():
                 raise ValueError(MESSAGES.INFO['MAINTENANCE'])
     
             # Defer response
-            try:
-                await interaction.response.defer(ephemeral=True)
-                response_sent = True
-            except discord.errors.InteractionResponded:
-                response_sent = True
-            except Exception:
-                pass
+            await interaction.response.defer(ephemeral=True)
+            response_sent = True
     
             # Get user's GrowID
             growid_response = await self.balance_service.get_growid(str(interaction.user.id))
-            if not growid_response.success or not growid_response.data:
-                raise ValueError(MESSAGES.ERROR['NOT_REGISTERED'])
+            if not growid_response.success:
+                raise ValueError(growid_response.error)
     
             growid = growid_response.data
     
-            # Get transaction history
-            trx_response = await self.trx_manager.get_transaction_history(
-                str(interaction.user.id),  # Menggunakan user ID langsung
+            # Get transaction history from balance manager
+            history_response = await self.balance_service.get_transaction_history(
+                growid,
                 limit=5
             )
     
-            if not trx_response.success:
-                raise ValueError(trx_response.error)
+            if not history_response.success:
+                raise ValueError(history_response.error)
     
-            transactions = trx_response.data
+            transactions = history_response.data
             if not transactions:
                 raise ValueError(MESSAGES.ERROR['NO_HISTORY'])
     
@@ -780,24 +861,36 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
             embed = discord.Embed(
                 title="📊 Riwayat Transaksi",
                 description=f"Transaksi terakhir untuk `{growid}`",
-                color=COLORS.INFO
+                color=COLORS.INFO,
+                timestamp=datetime.utcnow()
             )
     
             # Add transaction details
             for i, trx in enumerate(transactions, 1):
                 try:
-                    # Emoji berdasarkan tipe transaksi
-                    emoji = '💰' if 'DEPOSIT' in trx['type'] else '🛒' if 'PURCHASE' in trx['type'] else '💸'
-                    
+                    # Get emoji based on transaction type
+                    emoji = {
+                        TransactionType.DEPOSIT.value: '💰',
+                        TransactionType.PURCHASE.value: '🛒',
+                        TransactionType.WITHDRAWAL.value: '💸',
+                        TransactionType.TRANSFER_IN.value: '↙️',
+                        TransactionType.TRANSFER_OUT.value: '↗️',
+                        TransactionType.ADMIN_ADD.value: '⚡',
+                        TransactionType.ADMIN_REMOVE.value: '❌'
+                    }.get(trx['type'], '💱')
+    
+                    # Format date
+                    date = datetime.fromisoformat(trx['created_at'].replace('Z', '+00:00'))
+                    formatted_date = date.strftime("%Y-%m-%d %H:%M:%S")
+    
                     embed.add_field(
                         name=f"{emoji} Transaksi #{i}",
                         value=(
                             f"```yml\n"
-                            f"Tipe: {trx['type']}\n"
-                            f"Tanggal: {trx['date']}\n"
-                            f"Perubahan: {trx['change']}\n"
-                            f"Status: {trx['status']}\n"
-                            f"Detail: {trx['details']}\n"
+                            f"Tanggal : {formatted_date}\n"
+                            f"Tipe    : {trx['type']}\n"
+                            f"Jumlah  : {trx['amount_wl']:,} WL\n"
+                            f"Detail  : {trx['details']}\n"
                             "```"
                         ),
                         inline=False
@@ -807,16 +900,9 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
                     continue
     
             embed.set_footer(text=f"Menampilkan {len(transactions)} transaksi terakhir")
-            embed.timestamp = datetime.utcnow()
-    
-            # Send response
-            if response_sent:
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            else:
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
     
         except ValueError as e:
-            # Handle expected errors
             error_embed = discord.Embed(
                 title="❌ Error",
                 description=str(e),
@@ -826,8 +912,8 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
                 await interaction.followup.send(embed=error_embed, ephemeral=True)
             else:
                 await interaction.response.send_message(embed=error_embed, ephemeral=True)
+    
         except Exception as e:
-            # Handle unexpected errors
             self.logger.error(f"Error in history callback: {e}")
             error_embed = discord.Embed(
                 title="❌ Error",
@@ -838,6 +924,7 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
                 await interaction.followup.send(embed=error_embed, ephemeral=True)
             else:
                 await interaction.response.send_message(embed=error_embed, ephemeral=True)
+    
         finally:
             self.release_response_lock(interaction)
             
