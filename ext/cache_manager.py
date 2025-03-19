@@ -258,3 +258,20 @@ class CacheManager:
         except Exception as e:
             self.logger.error(f"Error deleting cache pattern {pattern}: {e}")
             raise
+# Di CacheManager, tambahkan method cleanup
+class CacheManager:
+    async def cleanup(self):
+        """Cleanup expired cache entries"""
+        try:
+            expired_keys = []
+            current_time = datetime.utcnow()
+            
+            for key, data in self.cache.items():
+                if data['expires_at'] and current_time > data['expires_at']:
+                    expired_keys.append(key)
+                    
+            for key in expired_keys:
+                del self.cache[key]
+                
+        except Exception as e:
+            logging.error(f"Error cleaning up cache: {e}")
