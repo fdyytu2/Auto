@@ -140,6 +140,25 @@ class AdminService(BaseLockHandler, BaseResponseHandler):
                 'commands': len(self.bot.commands),
                 'cache_stats': await self.cache_manager.get_stats()
             }
+# Tambahkan method check_blacklist di AdminService
+class AdminService:
+    async def check_blacklist(self, user_id: str) -> bool:
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                "SELECT is_blacklisted FROM users WHERE discord_id = ?",
+                (user_id,)
+            )
+            result = cursor.fetchone()
+            return result and result['is_blacklisted']
+        except Exception as e:
+            self.logger.error(f"Error checking blacklist: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
             
             return self.success_response(stats)
         except Exception as e:
