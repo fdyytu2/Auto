@@ -74,17 +74,20 @@ MAX_EMBED_SIZE = 6000  # Discord embed character limit
 # Valid Stock Formats
 VALID_STOCK_FORMATS = ['txt']  # Format file yang diizinkan untuk stock
 
-# Transaction Types
+# Di constants.py, tambahkan TRANSFER_ROLLBACK ke TransactionType
 class TransactionType(Enum):
     PURCHASE = "purchase"
     DEPOSIT = "deposit"
     WITHDRAWAL = "withdrawal"
     DONATION = "donation"
     ADMIN_ADD = "admin_add"
-    ADMIN_REMOVE = "admin_remove"
+    ADMIN_REMOVE = "admin_remove" 
     ADMIN_RESET = "admin_reset"
     REFUND = "refund"
     TRANSFER = "transfer"
+    TRANSFER_IN = "transfer_in"
+    TRANSFER_OUT = "transfer_out"
+    TRANSFER_ROLLBACK = "transfer_rollback" # Tambahkan ini
 
 # Status untuk database
 class Status(Enum):
