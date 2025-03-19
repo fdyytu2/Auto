@@ -1264,19 +1264,42 @@ class LiveButtonsCog(commands.Cog):
             except Exception as e:
                 self.logger.error(f"Error in cog_unload: {e}")
 
-    @tasks.loop(minutes=5.0)
-    async def cache_cleanup(self):
-        """Periodic cache cleanup task"""
+# Tambahkan setelah method cog_unload dan sebelum cache_cleanup
+
+    @tasks.loop(seconds=UPDATE_INTERVAL.LIVE_BUTTONS)  # Line 2726
+    async def check_display(self):
+        """Periodic check dan update display"""
         if not self._ready.is_set():
             return
 
         try:
             async with asyncio.timeout(30):
-                await self.button_manager.cache_manager.cleanup_expired()
+                # Verifikasi channel dan message 
+                channel = self.bot.get_channel(self.button_manager.stock_channel_id)
+                if not channel:
+                    self.logger.error(f"Channel {self.button_manager.stock_channel_id} not found")
+                    return
+
+                # Force update display dan buttons
+                await self.button_manager.force_update()
+
         except asyncio.TimeoutError:
-            self.logger.error("Cache cleanup timed out")
+            self.logger.error("Display check timed out")
         except Exception as e:
-            self.logger.error(f"Error in cache cleanup: {e}")
+            self.logger.error(f"Error in display check: {e}")
+
+    @check_display.before_loop  # Line 2747
+    async def before_check_display(self):
+        """Wait until ready before starting the loop"""
+        await self.bot.wait_until_ready()
+        await self._ready.wait()
+
+    @check_display.error  # Line 2751
+    async def check_display_error(self, error):
+        """Handle errors in check display task"""
+        self.logger.error(f"Error in check display task: {error}")
+
+    # Existing cache_cleanup task starts here...
 
     @cache_cleanup.before_loop
     async def before_cache_cleanup(self):
