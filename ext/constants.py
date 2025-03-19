@@ -469,6 +469,8 @@ class BUTTON_IDS:
 
 # Update Intervals (Existing)
 class UPDATE_INTERVAL:
+    LIVE_BUTTONS = 120  # Update buttons setiap 120 detik
+    CACHE_CLEANUP = 300
     LIVE_STOCK = 55.0    # Update live stock every 55 seconds
     BUTTONS = 30.0       # Update buttons every 30 seconds
     CACHE = 300.0        # Cache timeout 5 minutes
