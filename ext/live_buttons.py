@@ -338,8 +338,9 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
         self.trx_manager = TransactionManager(bot)
         self.admin_service = AdminService(bot)
         self.cache_manager = CacheManager()
+        self.callback_manager = ProductCallbackManager() # Tambahkan ini
         self.logger = logging.getLogger("ShopView")
-
+        
     async def _handle_interaction_error(self, interaction: discord.Interaction, error_msg: str, ephemeral: bool = True):
         """Helper untuk menangani interaction error"""
         try:
