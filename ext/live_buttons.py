@@ -232,8 +232,18 @@ class PurchaseModal(discord.ui.Modal, BaseResponseHandler):
                 await interaction.response.send_message(embed=error_embed, ephemeral=True)
 
         finally:
-            await self.cache_manager.cleanup()
-
+            # Invalidate cache spesifik yang berkaitan dengan transaksi
+            try:
+                if 'growid' in locals() and 'product_code' in locals():
+                    cache_keys = [
+                        f"balance_{growid}",        # Cache saldo user
+                        f"stock_{product_code}",     # Cache stock produk
+                        f"history_{interaction.user.id}"  # Cache riwayat transaksi
+                    ]
+                    for key in cache_keys:
+                        await self.cache_manager.delete(key)
+            except Exception as e:
+                self.logger.error(f"Error invalidating cache in purchase modal: {e}")
 
                 
 class RegisterModal(Modal, BaseResponseHandler):
@@ -810,7 +820,6 @@ class ShopView(View, BaseLockHandler, BaseResponseHandler):
             )
         finally:
             self.release_response_lock(interaction)
-            await self.cache_manager.cleanup()
             
     @discord.ui.button(
         style=discord.ButtonStyle.secondary,
@@ -1223,6 +1232,7 @@ class LiveButtonsCog(commands.Cog):
 
             # Start background tasks
             self.check_display.start()
+            self.cache_cleanup.start()  # Tambahkan ini
             self.logger.info("LiveButtonsCog loaded successfully")
 
         except Exception as e:
@@ -1236,8 +1246,9 @@ class LiveButtonsCog(commands.Cog):
                 # Stop background tasks
                 try:
                     self.check_display.cancel()
+                    self.cache_cleanup.cancel()
                 except Exception as e:
-                    self.logger.error(f"Error canceling check_display task: {e}")
+                    self.logger.error(f"Error canceling background tasks: {e}")
 
                 # Cleanup button manager
                 try:
@@ -1254,44 +1265,30 @@ class LiveButtonsCog(commands.Cog):
                 self.logger.error(f"Error in cog_unload: {e}")
 
     @tasks.loop(minutes=5.0)
-    async def check_display(self):
-        """Periodically check and update display with improved error handling"""
+    async def cache_cleanup(self):
+        """Periodic cache cleanup task"""
         if not self._ready.is_set():
             return
 
         try:
-            async with asyncio.timeout(30):  # Add timeout
-                message = self.button_manager.current_message
-                if not message:
-                    # Create new message if none exists
-                    await self.button_manager.get_or_create_message()
-                else:
-                    # Update embed only, NOT view
-                    if self.stock_manager:
-                        try:
-                            embed = await self.stock_manager.create_stock_embed()
-                            await message.edit(embed=embed)
-                        except discord.errors.NotFound:
-                            self.button_manager.current_message = None
-                            await self.button_manager.get_or_create_message()
-                        except Exception as e:
-                            self.logger.error(f"Error updating display: {e}")
-
+            async with asyncio.timeout(30):
+                await self.button_manager.cache_manager.cleanup_expired()
         except asyncio.TimeoutError:
-            self.logger.error("Display update timed out")
+            self.logger.error("Cache cleanup timed out")
         except Exception as e:
-            self.logger.error(f"Error in check_display: {e}")
+            self.logger.error(f"Error in cache cleanup: {e}")
 
-    @check_display.before_loop
-    async def before_check_display(self):
+    @cache_cleanup.before_loop
+    async def before_cache_cleanup(self):
         """Wait until ready before starting the loop"""
         await self.bot.wait_until_ready()
         await self._ready.wait()
 
-    @check_display.error
-    async def check_display_error(self, error):
-        """Handle errors in check_display task"""
-        self.logger.error(f"Error in check_display task: {error}")
+    @cache_cleanup.error
+    async def cache_cleanup_error(self, error):
+        """Handle errors in cache cleanup task"""
+        self.logger.error(f"Error in cache cleanup task: {error}")
+        
 async def setup(bot):
     """Setup cog with proper error handling"""
     try:
