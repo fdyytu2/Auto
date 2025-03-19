@@ -1,3 +1,10 @@
+"""
+Base Handler Module
+Author: fdyytu2
+Created at: 2025-03-07 18:04:56 UTC
+Last Modified: 2025-03-19 06:18:57 UTC
+"""
+
 import asyncio
 from asyncio import Lock
 import logging
@@ -9,7 +16,7 @@ from ext.cache_manager import CacheManager
 class BaseLockHandler:
     """Handler untuk sistem locking"""
     
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         self._locks: Dict[str, Lock] = {}
         self._response_locks: Dict[str, Lock] = {}
         self.logger = logging.getLogger(self.__class__.__name__)
